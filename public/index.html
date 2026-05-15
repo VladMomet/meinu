@@ -333,7 +333,7 @@ a{color:inherit;text-decoration:none}
   padding:64px 0;
 }
 @media (min-width:900px){
-  .hero-grid{ grid-template-columns: 7fr 5fr; gap:32px; padding:112px 0 }
+  .hero-grid{ grid-template-columns: 6fr 6fr; gap:48px; padding:112px 0 }
 }
 
 .hero-watermark{
@@ -388,18 +388,19 @@ a{color:inherit;text-decoration:none}
 .hero-collage{
   position:relative; z-index:2;
   display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:12px;
+  grid-template-columns: 1.4fr 1fr;
+  gap:16px;
 }
 @media (min-width:900px){
-  .hero-collage{ padding-top:48px }
+  .hero-collage{ padding-top:24px; gap:20px }
 }
 .hero-collage .tile{
   position:relative;
   overflow:hidden;
-  border-radius:var(--r-xl);
+  border-radius:var(--r-2xl);
   background:var(--paper-warm);
   transition:transform .5s var(--ease-out);
+  box-shadow:0 1px 2px rgba(26,20,16,0.04), 0 30px 60px -30px rgba(26,20,16,0.2);
 }
 .hero-collage .tile:hover .art{ transform:scale(1.05) }
 .hero-collage .tile.large{
@@ -2177,7 +2178,23 @@ function refreshCurrentView(){
 
 function renderHome(){
   const featured = [...PRODUCTS].sort((a,b) => b.price - a.price).slice(0, 8);
-  const collage = featured.slice(0, 3);
+  // Коллаж — берём по одному товару из разных категорий, чтобы фото не дублировались
+  const usedCategories = new Set();
+  const collage = [];
+  for(const p of [...PRODUCTS].sort((a,b) => b.price - a.price)){
+    if(!p.img || usedCategories.has(p.category)) continue;
+    collage.push(p);
+    usedCategories.add(p.category);
+    if(collage.length === 3) break;
+  }
+  // Запасной вариант если категорий мало
+  if(collage.length < 3){
+    for(const p of [...PRODUCTS].sort((a,b) => b.price - a.price)){
+      if(collage.find(c => c.id === p.id)) continue;
+      collage.push(p);
+      if(collage.length === 3) break;
+    }
+  }
 
   $('#app').innerHTML = `
     <section class="hero">
@@ -2190,9 +2207,9 @@ function renderHome(){
               <span>Beauty-опт · с&nbsp;2019</span>
             </p>
             <h1 class="hero-title display-headline">
-              Beauty,<br>
-              которая<br>
-              <em>приносит&nbsp;деньги</em>.
+              Beauty<br>
+              приносит<br>
+              <em>деньги</em>.
             </h1>
             <p class="hero-subtitle">
               Опт beauty-товаров из&nbsp;Китая. Прозрачная цена сразу с&nbsp;доставкой, белая поставка с&nbsp;пакетом ВЭД-документов. Сроки <strong>15–25&nbsp;дней до&nbsp;${cityGen(city)}</strong>.
