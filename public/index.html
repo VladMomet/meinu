@@ -667,12 +667,29 @@ a{color:inherit;text-decoration:none}
   color:var(--paper);
 }
 .p-card-counter button:hover{ background:var(--accent) }
-.p-card-counter .qty{
-  min-width:28px; text-align:center;
+.p-card-counter .qty,
+.p-card-counter .qty-input{
+  min-width:32px; text-align:center;
   font-family:var(--font-mono);
   font-size:12px;
   font-variant-numeric:tabular-nums;
   padding:0 4px;
+  color:var(--paper);
+}
+.qty-input{
+  background:transparent; border:0;
+  width:auto; max-width:80px;
+  -moz-appearance:textfield;
+  cursor:text;
+}
+.qty-input::-webkit-outer-spin-button,
+.qty-input::-webkit-inner-spin-button{
+  -webkit-appearance:none; margin:0;
+}
+.qty-input:focus{
+  outline:0;
+  background:rgba(255,255,255,0.12);
+  border-radius:4px;
 }
 
 /* ============================================================
@@ -1028,11 +1045,27 @@ a{color:inherit;text-decoration:none}
   transition:background .15s var(--ease);
 }
 .qty-stepper button:hover{ background:var(--paper-warm) }
-.qty-stepper .val{
-  min-width:48px; text-align:center;
+.qty-stepper .val,
+.qty-stepper .val-input{
+  min-width:48px; max-width:100px;
+  text-align:center;
   font-family:var(--font-mono);
   font-size:14px;
   font-variant-numeric:tabular-nums;
+  color:var(--ink);
+  background:transparent;
+  border:0;
+  padding:0 4px;
+  height:46px;
+  -moz-appearance:textfield;
+}
+.qty-stepper .val-input::-webkit-outer-spin-button,
+.qty-stepper .val-input::-webkit-inner-spin-button{
+  -webkit-appearance:none; margin:0;
+}
+.qty-stepper .val-input:focus{
+  outline:0;
+  background:var(--paper-warm);
 }
 
 .trust-block{
@@ -2167,7 +2200,13 @@ function productCard(p, index){
       ${itemInCart ? `
         <div class="p-card-counter" onclick="event.preventDefault();event.stopPropagation()">
           <button onclick="event.preventDefault();event.stopPropagation();cardCounter('${p.id}', -1)" aria-label="Уменьшить">−</button>
-          <span class="qty">${itemInCart.qty}</span>
+          <input class="qty-input qty" type="number" inputmode="numeric" value="${itemInCart.qty}"
+                 min="${p.moq}" max="1000000"
+                 aria-label="Количество"
+                 onclick="event.preventDefault();event.stopPropagation();this.select()"
+                 onfocus="this.select()"
+                 onchange="cardSetQty('${p.id}', this.value)"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">
           <button onclick="event.preventDefault();event.stopPropagation();cardCounter('${p.id}', 1)" aria-label="Увеличить">+</button>
         </div>
       ` : `
@@ -2197,7 +2236,25 @@ function cardCounter(id, delta){
   if(next < p.moq){
     cart = cart.filter(x => x.id !== id);
   } else {
-    it.qty = next;
+    it.qty = Math.min(next, 1000000);
+  }
+  saveCart();
+  refreshCurrentView();
+}
+
+function cardSetQty(id, val){
+  const it = cart.find(x => x.id === id);
+  if(!it) return;
+  const p = PRODUCTS.find(x => x.id === id);
+  const v = parseInt(String(val).replace(/\D/g,''), 10);
+  if(isNaN(v) || v <= 0){
+    cart = cart.filter(x => x.id !== id);
+    toast('Товар убран из корзины');
+  } else if(v < p.moq){
+    it.qty = p.moq;
+    toast(`Минимум ${p.moq} шт — округлили до минимума`);
+  } else {
+    it.qty = Math.min(v, 1000000);
   }
   saveCart();
   refreshCurrentView();
@@ -2222,7 +2279,7 @@ function renderHome(){
   const featured = [...PRODUCTS].sort((a,b) => b.price - a.price).slice(0, 8);
   // Коллаж в hero — beauty-тематические категории по приоритету.
   // Из каждой берём самый дорогой товар с фото — это обычно «флагман» категории.
-  const collagePreferred = ['hair', 'nails', 'skincare', 'makeup'];
+  const collagePreferred = ['nails', 'skincare', 'hair', 'makeup'];
   const collage = [];
   for(const cat of collagePreferred){
     if(collage.length >= 3) break;
@@ -2536,7 +2593,11 @@ function renderProduct(id){
             <div class="pdp-actions">
               <div class="qty-stepper">
                 <button onclick="pdpQty(-1)" aria-label="Уменьшить">−</button>
-                <span class="val" id="pdp-qty">${_pdpQty}</span>
+                <input class="val val-input" id="pdp-qty" type="number" inputmode="numeric"
+                       value="${_pdpQty}" min="${p.moq}" max="1000000" aria-label="Количество"
+                       onfocus="this.select()"
+                       onchange="pdpSetQty(this.value)"
+                       onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">
                 <button onclick="pdpQty(1)" aria-label="Увеличить">+</button>
               </div>
               <button class="btn lg" onclick="addToCartFromPdp()" style="flex:1; min-width:200px"><span id="pdp-add-label">В&nbsp;корзину · ${fmt(p.price * _pdpQty)}&nbsp;₽</span></button>
@@ -2584,8 +2645,24 @@ function renderProduct(id){
 function pdpQty(delta){
   const p = PRODUCTS.find(x => x.id === _pdpId);
   if(!p) return;
-  _pdpQty = Math.max(p.moq, _pdpQty + delta);
-  $('#pdp-qty').textContent = _pdpQty;
+  _pdpQty = Math.min(Math.max(p.moq, _pdpQty + delta), 1000000);
+  const el = $('#pdp-qty');
+  if(el) el.value = _pdpQty;
+  $('#pdp-add-label').innerHTML = `В&nbsp;корзину · ${fmt(p.price * _pdpQty)}&nbsp;₽`;
+}
+
+function pdpSetQty(val){
+  const p = PRODUCTS.find(x => x.id === _pdpId);
+  if(!p) return;
+  const v = parseInt(String(val).replace(/\D/g,''), 10);
+  if(isNaN(v) || v < p.moq){
+    _pdpQty = p.moq;
+    if(!isNaN(v) && v > 0 && v < p.moq) toast(`Минимум ${p.moq} шт — округлили до минимума`);
+  } else {
+    _pdpQty = Math.min(v, 1000000);
+  }
+  const el = $('#pdp-qty');
+  if(el) el.value = _pdpQty;
   $('#pdp-add-label').innerHTML = `В&nbsp;корзину · ${fmt(p.price * _pdpQty)}&nbsp;₽`;
 }
 
@@ -2645,7 +2722,11 @@ function renderCart(){
                   <div class="cart-row-controls">
                     <div class="p-card-counter" style="height:34px">
                       <button onclick="cartQty('${p.id}', -1)" style="width:30px;height:34px">−</button>
-                      <span class="qty">${it.qty}</span>
+                      <input class="qty-input qty" type="number" inputmode="numeric"
+                             value="${it.qty}" min="${p.moq}" max="1000000" aria-label="Количество"
+                             onfocus="this.select()"
+                             onchange="cartSetQty('${p.id}', this.value)"
+                             onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">
                       <button onclick="cartQty('${p.id}', 1)" style="width:30px;height:34px">+</button>
                     </div>
                     <button class="cart-row-remove" onclick="cartRemove('${p.id}')">Удалить</button>
@@ -2690,7 +2771,25 @@ function cartQty(id, delta){
     toast(`Минимум для этой позиции — ${p.moq} шт`);
     return;
   }
-  it.qty = next;
+  it.qty = Math.min(next, 1000000);
+  saveCart();
+  renderCart();
+}
+
+function cartSetQty(id, val){
+  const it = cart.find(x => x.id === id);
+  if(!it) return;
+  const p = PRODUCTS.find(x => x.id === id);
+  const v = parseInt(String(val).replace(/\D/g,''), 10);
+  if(isNaN(v) || v <= 0){
+    cart = cart.filter(x => x.id !== id);
+    toast('Товар убран из корзины');
+  } else if(v < p.moq){
+    it.qty = p.moq;
+    toast(`Минимум ${p.moq} шт — округлили до минимума`);
+  } else {
+    it.qty = Math.min(v, 1000000);
+  }
   saveCart();
   renderCart();
 }
