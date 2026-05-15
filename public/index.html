@@ -1977,6 +1977,42 @@ function toast(msg){
   toast._t = setTimeout(()=>t.classList.remove('show'), 2400);
 }
 
+/* === API helpers === */
+async function apiFetch(path, opts){
+  opts = opts || {};
+  const init = {
+    method: opts.method || 'GET',
+    credentials: 'same-origin',
+    headers: { 'Accept': 'application/json' },
+  };
+  if(opts.body){
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(opts.body);
+  }
+  const res = await fetch(path, init);
+  let data = null;
+  try { data = await res.json() } catch(e) {}
+  if(!res.ok){
+    const err = new Error((data && data.error) || ('HTTP ' + res.status));
+    err.status = res.status;
+    err.detail = data && data.detail;
+    throw err;
+  }
+  return data || {};
+}
+
+/* === Sync user from server cookie session === */
+async function syncUser(){
+  try {
+    const data = await apiFetch('/api/me');
+    user = data.user;
+    saveUser();
+  } catch(e) {
+    // оффлайн / сервер недоступен — оставляем кэш из localStorage
+    console.warn('syncUser failed:', e.message);
+  }
+}
+
 $('#town-trigger').addEventListener('click', openTownModal);
 
 function openTownModal(){
@@ -2092,6 +2128,12 @@ function renderOffer(){ renderHome() }
 function renderPersonalData(){ renderHome() }
 
 updateCartBadge();
+// Фоновая синхронизация сессии — если cookie от прошлого визита жива,
+// подтянем user с сервера и поправим locally cached user
+syncUser().then(() => {
+  // Если текущий view — профиль, перерисуем после получения свежего user
+  if((location.hash || '').startsWith('#/profile')) route({ keepScroll: true });
+});
 </script>
 <script>
 /* ============================================================
@@ -2664,36 +2706,51 @@ function checkout(){
   finalizeOrder();
 }
 
-function finalizeOrder(){
+async function finalizeOrder(){
   const items = cart.map(it => ({ ...it, product: PRODUCTS.find(p => p.id === it.id) })).filter(x => x.product);
-  const subtotal = items.reduce((s,it) => s + it.product.price * it.qty, 0);
-  const orderNum = 'MN-' + new Date().toISOString().slice(2,10).replace(/-/g,'') + '-' + String(Math.floor(Math.random()*900)+100);
+  if(items.length === 0) return;
 
-  const orders = State.get('orders', []);
-  orders.unshift({
-    id: orderNum,
-    date: new Date().toISOString(),
-    items: items.map(it => ({ id: it.id, name: it.product.name, qty: it.qty, price: it.product.price })),
-    total: subtotal,
+  const payload = {
     city: city,
-    status: 'new'
-  });
-  State.set('orders', orders);
+    items: items.map(it => ({ id: it.id, name: it.product.name, qty: it.qty, price: it.product.price })),
+  };
 
-  cart = [];
-  saveCart();
+  // Заблокируем UI пока идёт запрос
+  toast('Отправляем заказ...');
 
-  showSuccessModal(`Заказ ${orderNum} принят`, `Менеджер свяжется с&nbsp;вами в&nbsp;течение часа в&nbsp;рабочее время — подтвердит детали и&nbsp;выставит счёт.`, '#/profile/orders');
+  try {
+    const data = await apiFetch('/api/orders', { method: 'POST', body: payload });
+    const orderId = data.order && data.order.id;
+    cart = [];
+    saveCart();
+    showSuccessModal(`Заказ ${orderId || ''} принят`, `Менеджер свяжется с&nbsp;вами в&nbsp;течение часа в&nbsp;рабочее время — подтвердит детали и&nbsp;выставит счёт.`, '#/profile/orders');
+  } catch(e) {
+    if(e.status === 401){
+      // Сессия истекла — пробуем зарегистрировать заново
+      openRegisterModal(() => finalizeOrder());
+      return;
+    }
+    toast('Не удалось оформить заказ: ' + e.message);
+  }
 }
 
-/* === REGISTER ================================================== */
+/* === REGISTER / LOGIN ============================================ */
 
-let _regTab = 'private';
+let _regMode = 'register';   // 'register' | 'login'
+let _regTab = 'private';     // 'private' | 'business' (только для register)
 let _regCallback = null;
+let _regBusy = false;
 
 function openRegisterModal(callback){
   _regCallback = callback || null;
+  _regMode = 'register';
   _regTab = 'private';
+  paintRegisterModal();
+}
+
+function openLoginModal(callback){
+  _regCallback = callback || null;
+  _regMode = 'login';
   paintRegisterModal();
 }
 
@@ -2703,94 +2760,146 @@ function paintRegisterModal(){
   const m = document.createElement('div');
   m.className = 'modal-bg';
   m.setAttribute('data-reg', '1');
-  m.innerHTML = `<div class="modal">
-    <button class="modal-close" data-close>✕</button>
+
+  const headerHtml = _regMode === 'login' ? `
+    <div class="modal-head">
+      <h2>С&nbsp;<em>возвращением</em></h2>
+      <p style="font-size:13px;color:var(--ink-muted);margin:6px 0 0;line-height:1.5">Войдите по&nbsp;телефону и&nbsp;паролю, чтобы&nbsp;увидеть свои заказы и&nbsp;оформить новый.</p>
+    </div>
+  ` : `
     <div class="modal-head">
       <h2>Создайте <em>аккаунт</em></h2>
       <p style="font-size:13px;color:var(--ink-muted);margin:6px 0 0;line-height:1.5">Нужны минимальные данные для&nbsp;связи. Заказы и&nbsp;статусы будут в&nbsp;личном кабинете.</p>
     </div>
-    <div class="modal-body">
-      <div class="tabs">
-        <button class="tab ${_regTab==='private'?'on':''}" onclick="regSetTab('private')">Физлицо</button>
-        <button class="tab ${_regTab==='business'?'on':''}" onclick="regSetTab('business')">Юрлицо</button>
+  `;
+
+  const bodyHtml = _regMode === 'login' ? `
+    <div class="field">
+      <label>Телефон</label>
+      <input id="reg-phone" type="tel" placeholder="+7 (___) ___-__-__" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>Пароль</label>
+      <input id="reg-pass" type="password" placeholder="Ваш пароль" autocomplete="current-password">
+    </div>
+    <div id="reg-error" class="field-error" style="display:none"></div>
+    <p style="font-size:12px;color:var(--ink-subtle);margin:18px 0 0;line-height:1.5">
+      Забыли пароль? Напишите менеджеру в&nbsp;<a href="https://t.me/meinu_ru" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">Telegram</a> &mdash; восстановим вручную.
+    </p>
+  ` : `
+    <div class="tabs">
+      <button class="tab ${_regTab==='private'?'on':''}" onclick="regSetTab('private')">Физлицо</button>
+      <button class="tab ${_regTab==='business'?'on':''}" onclick="regSetTab('business')">Юрлицо</button>
+    </div>
+    ${_regTab === 'private' ? `
+      <div class="field-row">
+        <div class="field">
+          <label>Имя</label>
+          <input id="reg-name" type="text" placeholder="Анна" autocomplete="given-name">
+        </div>
+        <div class="field">
+          <label>Телефон</label>
+          <input id="reg-phone" type="tel" placeholder="+7 (___) ___-__-__" autocomplete="tel">
+        </div>
       </div>
-      ${_regTab === 'private' ? `
-        <div class="field-row">
-          <div class="field">
-            <label>Имя</label>
-            <input id="reg-name" type="text" placeholder="Анна">
-          </div>
-          <div class="field">
-            <label>Телефон</label>
-            <input id="reg-phone" type="tel" placeholder="+7 (___) ___-__-__">
-          </div>
+      <div class="field">
+        <label>E-mail <span class="opt">— опционально</span></label>
+        <input id="reg-email" type="email" placeholder="anna@example.com" autocomplete="email">
+        <div class="field-hint">Без&nbsp;e-mail сброс пароля возможен только через&nbsp;менеджера в&nbsp;Telegram.</div>
+      </div>
+      <div class="field">
+        <label>Пароль</label>
+        <input id="reg-pass" type="password" placeholder="Минимум 6&nbsp;символов" autocomplete="new-password">
+      </div>
+    ` : `
+      <div class="field">
+        <label>Название организации</label>
+        <input id="reg-org" type="text" placeholder='ООО «Ромашка»' autocomplete="organization">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>ИНН</label>
+          <input id="reg-inn" type="text" placeholder="10 или 12 цифр">
         </div>
         <div class="field">
-          <label>E-mail <span class="opt">— опционально</span></label>
-          <input id="reg-email" type="email" placeholder="anna@example.com">
-          <div class="field-hint">Без&nbsp;e-mail сброс пароля возможен только через&nbsp;менеджера в&nbsp;Telegram.</div>
+          <label>КПП</label>
+          <input id="reg-kpp" type="text" placeholder="9 цифр">
+        </div>
+      </div>
+      <div class="field">
+        <label>ОГРН / ОГРНИП</label>
+        <input id="reg-ogrn" type="text" placeholder="13 или 15 цифр">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Контактное лицо</label>
+          <input id="reg-name" type="text" placeholder="Анна Иванова" autocomplete="name">
         </div>
         <div class="field">
-          <label>Пароль</label>
-          <input id="reg-pass" type="password" placeholder="Минимум 6&nbsp;символов">
+          <label>Телефон</label>
+          <input id="reg-phone" type="tel" placeholder="+7 (___) ___-__-__" autocomplete="tel">
         </div>
-      ` : `
-        <div class="field">
-          <label>Название организации</label>
-          <input id="reg-org" type="text" placeholder='ООО «Ромашка»'>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label>ИНН</label>
-            <input id="reg-inn" type="text" placeholder="10 или 12 цифр">
-          </div>
-          <div class="field">
-            <label>КПП</label>
-            <input id="reg-kpp" type="text" placeholder="9 цифр">
-          </div>
-        </div>
-        <div class="field">
-          <label>ОГРН / ОГРНИП</label>
-          <input id="reg-ogrn" type="text" placeholder="13 или 15 цифр">
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label>Контактное лицо</label>
-            <input id="reg-name" type="text" placeholder="Анна Иванова">
-          </div>
-          <div class="field">
-            <label>Телефон</label>
-            <input id="reg-phone" type="tel" placeholder="+7 (___) ___-__-__">
-          </div>
-        </div>
-        <div class="field">
-          <label>E-mail <span class="opt">— опционально</span></label>
-          <input id="reg-email" type="email" placeholder="director@example.com">
-          <div class="field-hint">Без&nbsp;e-mail сброс пароля возможен только через&nbsp;менеджера в&nbsp;Telegram.</div>
-        </div>
-        <div class="field">
-          <label>Пароль</label>
-          <input id="reg-pass" type="password" placeholder="Минимум 6&nbsp;символов">
-        </div>
-      `}
-      <div id="reg-error" class="field-error" style="display:none"></div>
-      <p style="font-size:12px;color:var(--ink-subtle);margin:18px 0 0;line-height:1.5">
-        Нажимая «Создать аккаунт», вы&nbsp;соглашаетесь с&nbsp;<a href="#/offer" style="color:var(--accent);text-decoration:underline" data-close>офертой</a> и&nbsp;<a href="#/privacy" style="color:var(--accent);text-decoration:underline" data-close>политикой обработки данных</a> (152-ФЗ).
-      </p>
+      </div>
+      <div class="field">
+        <label>E-mail <span class="opt">— опционально</span></label>
+        <input id="reg-email" type="email" placeholder="director@example.com" autocomplete="email">
+        <div class="field-hint">Без&nbsp;e-mail сброс пароля возможен только через&nbsp;менеджера в&nbsp;Telegram.</div>
+      </div>
+      <div class="field">
+        <label>Пароль</label>
+        <input id="reg-pass" type="password" placeholder="Минимум 6&nbsp;символов" autocomplete="new-password">
+      </div>
+    `}
+    <div id="reg-error" class="field-error" style="display:none"></div>
+    <p style="font-size:12px;color:var(--ink-subtle);margin:18px 0 0;line-height:1.5">
+      Нажимая «Создать аккаунт», вы&nbsp;соглашаетесь с&nbsp;<a href="#/offer" style="color:var(--accent);text-decoration:underline" data-close>офертой</a> и&nbsp;<a href="#/privacy" style="color:var(--accent);text-decoration:underline" data-close>политикой обработки данных</a> (152-ФЗ).
+    </p>
+  `;
+
+  const footerHtml = _regMode === 'login' ? `
+    <div class="modal-foot" style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn full" id="reg-submit-btn" onclick="submitLogin()">Войти</button>
+      <button class="btn outline full" onclick="regSetMode('register')">Создать аккаунт</button>
     </div>
-    <div class="modal-foot">
-      <button class="btn full" onclick="submitRegister()">Создать аккаунт</button>
+  ` : `
+    <div class="modal-foot" style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn full" id="reg-submit-btn" onclick="submitRegister()">Создать аккаунт</button>
+      <button class="btn outline full" onclick="regSetMode('login')">У меня уже есть аккаунт</button>
     </div>
+  `;
+
+  m.innerHTML = `<div class="modal">
+    <button class="modal-close" data-close>✕</button>
+    ${headerHtml}
+    <div class="modal-body">
+      ${bodyHtml}
+    </div>
+    ${footerHtml}
   </div>`;
+
   document.body.appendChild(m);
   m.addEventListener('click', e => {
-    if(e.target === m || e.target.dataset.close !== undefined){ m.remove(); _regCallback = null }
+    if(e.target === m || e.target.dataset.close !== undefined){
+      m.remove(); _regCallback = null;
+    }
   });
 }
 
 function regSetTab(tab){ _regTab = tab; paintRegisterModal() }
+function regSetMode(mode){ _regMode = mode; paintRegisterModal() }
 
-function submitRegister(){
+function setRegBusy(busy){
+  _regBusy = busy;
+  const btn = $('#reg-submit-btn');
+  if(btn){
+    btn.disabled = busy;
+    btn.style.opacity = busy ? '.6' : '';
+    btn.style.pointerEvents = busy ? 'none' : '';
+  }
+}
+
+async function submitRegister(){
+  if(_regBusy) return;
   const err = $('#reg-error');
   err.style.display = 'none';
 
@@ -2803,27 +2912,91 @@ function submitRegister(){
   if(!phone.trim() || phone.replace(/\D/g,'').length < 10){ err.textContent = 'Укажите корректный телефон'; err.style.display='block'; return }
   if(pass.length < 6){ err.textContent = 'Пароль минимум 6 символов'; err.style.display='block'; return }
 
-  let payload = { type: _regTab, name, phone, email, createdAt: new Date().toISOString() };
+  const payload = {
+    type: _regTab,
+    name: name.trim(),
+    phone: phone.trim(),
+    email: email.trim() || undefined,
+    password: pass,
+  };
   if(_regTab === 'business'){
-    const org = ($('#reg-org')||{}).value || '';
+    const orgName = ($('#reg-org')||{}).value || '';
     const inn = ($('#reg-inn')||{}).value || '';
     const kpp = ($('#reg-kpp')||{}).value || '';
     const ogrn = ($('#reg-ogrn')||{}).value || '';
-    if(!org.trim()){ err.textContent = 'Укажите название организации'; err.style.display='block'; return }
+    if(!orgName.trim()){ err.textContent = 'Укажите название организации'; err.style.display='block'; return }
     if(inn.replace(/\D/g,'').length < 10){ err.textContent = 'Укажите корректный ИНН'; err.style.display='block'; return }
-    payload = { ...payload, org, inn, kpp, ogrn };
+    payload.orgName = orgName.trim();
+    payload.inn = inn.trim();
+    payload.kpp = kpp.trim();
+    payload.ogrn = ogrn.trim();
   }
 
-  user = payload;
-  saveUser();
+  setRegBusy(true);
+  try {
+    const data = await apiFetch('/api/register', { method: 'POST', body: payload });
+    user = data.user;
+    saveUser();
 
-  const modal = document.querySelector('.modal-bg[data-reg]');
-  if(modal) modal.remove();
+    const modal = document.querySelector('.modal-bg[data-reg]');
+    if(modal) modal.remove();
 
-  const cb = _regCallback;
-  _regCallback = null;
-  if(cb) cb();
-  else { toast('Аккаунт создан'); location.hash = '#/profile' }
+    const cb = _regCallback;
+    _regCallback = null;
+    if(cb) cb();
+    else { toast('Аккаунт создан'); location.hash = '#/profile' }
+  } catch(e) {
+    err.textContent = parseAuthError(e) || 'Не удалось создать аккаунт. Попробуйте ещё раз.';
+    err.style.display = 'block';
+  } finally {
+    setRegBusy(false);
+  }
+}
+
+async function submitLogin(){
+  if(_regBusy) return;
+  const err = $('#reg-error');
+  err.style.display = 'none';
+
+  const phone = ($('#reg-phone')||{}).value || '';
+  const pass = ($('#reg-pass')||{}).value || '';
+
+  if(!phone.trim()){ err.textContent = 'Укажите телефон'; err.style.display='block'; return }
+  if(!pass){ err.textContent = 'Введите пароль'; err.style.display='block'; return }
+
+  setRegBusy(true);
+  try {
+    const data = await apiFetch('/api/auth/login', {
+      method: 'POST',
+      body: { phone: phone.trim(), password: pass },
+    });
+    user = data.user;
+    saveUser();
+
+    const modal = document.querySelector('.modal-bg[data-reg]');
+    if(modal) modal.remove();
+
+    const cb = _regCallback;
+    _regCallback = null;
+    if(cb) cb();
+    else { toast('С возвращением, ' + (user.name || '').split(' ')[0]); location.hash = '#/profile' }
+  } catch(e) {
+    if(e.status === 401){
+      err.textContent = 'Неверный телефон или пароль';
+    } else {
+      err.textContent = 'Не удалось войти. Попробуйте ещё раз.';
+    }
+    err.style.display = 'block';
+  } finally {
+    setRegBusy(false);
+  }
+}
+
+function parseAuthError(e){
+  if(!e || !e.detail) return null;
+  // Drizzle/Postgres unique violation
+  if(String(e.message).includes('duplicate')) return 'Аккаунт с таким телефоном уже есть. Попробуйте войти.';
+  return null;
 }
 
 function showSuccessModal(title, text, redirect){
@@ -2859,7 +3032,10 @@ function renderProfile(tab){
             <div class="glyph">美</div>
             <h2>Личный кабинет</h2>
             <p>Войдите в&nbsp;аккаунт или&nbsp;создайте новый — увидите свои заказы и&nbsp;статусы.</p>
-            <button class="btn lg" onclick="openRegisterModal()">Создать аккаунт</button>
+            <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+              <button class="btn lg" onclick="openLoginModal()">Войти</button>
+              <button class="btn outline lg" onclick="openRegisterModal()">Создать аккаунт</button>
+            </div>
           </div>
         </div>
       </div>
@@ -2867,90 +3043,20 @@ function renderProfile(tab){
     return;
   }
 
-  const orders = State.get('orders', []);
-  const customs = State.get('customs', []);
-
+  // Сразу рендерим каркас профиля с заглушкой для активной вкладки,
+  // потом подгружаем данные с сервера и вставляем в .prof-content
   let content = '';
-  if(tab === 'orders'){
-    content = orders.length === 0
-      ? `<p style="padding:40px 0;color:var(--ink-muted);font-size:15px">Заказов пока нет. <a href="#/catalog" style="color:var(--accent);text-decoration:underline">Открыть каталог →</a></p>`
-      : orders.map(o => `<div class="order-card">
-          <div class="order-head">
-            <span class="order-id">${o.id}</span>
-            <span class="order-status s-${o.status}">${statusLabel(o.status)}</span>
-          </div>
-          <div class="order-items">
-            ${o.items.slice(0,3).map(i => `${escapeHtml(i.name).slice(0,50)} — ${i.qty}&nbsp;шт`).join('<br>')}
-            ${o.items.length > 3 ? `<br><span style="color:var(--ink-subtle)">и&nbsp;ещё ${o.items.length-3} ${plural(o.items.length-3,'позиция','позиции','позиций')}</span>` : ''}
-          </div>
-          <div class="order-foot">
-            <span style="color:var(--ink-muted)">${new Date(o.date).toLocaleDateString('ru-RU')} · ${o.city}</span>
-            <span class="order-total">${fmt(o.total)}&nbsp;₽</span>
-          </div>
-        </div>`).join('');
-  } else if(tab === 'customs'){
-    content = customs.length === 0
-      ? `<p style="padding:40px 0;color:var(--ink-muted);font-size:15px">Заявок на&nbsp;подбор пока нет. <a href="#/custom" style="color:var(--accent);text-decoration:underline">Оставить заявку →</a></p>`
-      : customs.map(c => `<div class="order-card">
-          <div class="order-head">
-            <span class="order-id">${c.id}</span>
-            <span class="order-status s-${c.status}">${statusLabel(c.status)}</span>
-          </div>
-          <div class="order-items">${escapeHtml(c.desc).slice(0,200)}${c.desc.length>200?'…':''}</div>
-          <div class="order-foot">
-            <span style="color:var(--ink-muted)">${new Date(c.date).toLocaleDateString('ru-RU')} · ${c.qty}&nbsp;${plural(c.qty,'шт','шт','шт')}</span>
-            <span style="color:var(--ink-muted)">${c.photos || 0}&nbsp;фото-референса</span>
-          </div>
-        </div>`).join('');
+  if(tab === 'orders' || tab === 'customs'){
+    content = `<p style="padding:40px 0;color:var(--ink-subtle);font-size:14px">Загружаем…</p>`;
   } else if(tab === 'info'){
-    content = `
-      <div style="max-width:520px">
-        <h3 style="font-family:var(--font-display);font-variation-settings:'opsz' 80;font-size:22px;margin:0 0 24px;font-weight:500">Контактные данные</h3>
-        <div class="field">
-          <label>Имя</label>
-          <input id="info-name" type="text" value="${escapeHtml(user.name||'')}">
-        </div>
-        <div class="field">
-          <label>Телефон</label>
-          <input id="info-phone" type="tel" value="${escapeHtml(user.phone||'')}">
-        </div>
-        <div class="field">
-          <label>E-mail</label>
-          <input id="info-email" type="email" value="${escapeHtml(user.email||'')}">
-        </div>
-        <button class="btn" onclick="saveInfo()">Сохранить</button>
-      </div>
-    `;
+    content = profileInfoFormHtml();
   } else if(tab === 'org' && user.type === 'business'){
-    content = `
-      <div style="max-width:520px">
-        <h3 style="font-family:var(--font-display);font-variation-settings:'opsz' 80;font-size:22px;margin:0 0 24px;font-weight:500">Реквизиты организации</h3>
-        <div class="field">
-          <label>Название</label>
-          <input id="org-name" type="text" value="${escapeHtml(user.org||'')}">
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label>ИНН</label>
-            <input id="org-inn" type="text" value="${escapeHtml(user.inn||'')}">
-          </div>
-          <div class="field">
-            <label>КПП</label>
-            <input id="org-kpp" type="text" value="${escapeHtml(user.kpp||'')}">
-          </div>
-        </div>
-        <div class="field">
-          <label>ОГРН / ОГРНИП</label>
-          <input id="org-ogrn" type="text" value="${escapeHtml(user.ogrn||'')}">
-        </div>
-        <button class="btn" onclick="saveOrg()">Сохранить</button>
-      </div>
-    `;
+    content = profileOrgFormHtml();
   }
 
   const tabs = [
-    { key: 'orders', label: 'Заказы', count: orders.length },
-    { key: 'customs', label: 'Подборки', count: customs.length },
+    { key: 'orders', label: 'Заказы' },
+    { key: 'customs', label: 'Подборки' },
     { key: 'info', label: 'Профиль' },
   ];
   if(user.type === 'business') tabs.push({ key: 'org', label: 'Реквизиты' });
@@ -2960,16 +3066,131 @@ function renderProfile(tab){
       <div class="jia-container">
         <p class="display-eyebrow">Личный кабинет</p>
         <h1 style="font-family:var(--font-display);font-variation-settings:'opsz' 144;font-size:clamp(36px,5vw,56px);line-height:1;letter-spacing:-.025em;margin:8px 0 4px;font-weight:400">Привет, <em style="font-style:normal;font-variation-settings:'opsz' 144,'SOFT' 100,'WONK' 1;color:var(--accent)">${escapeHtml((user.name||'').split(' ')[0] || 'друг')}</em></h1>
-        <p style="font-size:14px;color:var(--ink-muted);margin:8px 0 0">${user.type === 'business' ? (user.org ? escapeHtml(user.org) : 'Юрлицо') : 'Физлицо'} · ${escapeHtml(user.phone||'')}</p>
+        <p style="font-size:14px;color:var(--ink-muted);margin:8px 0 0">${user.type === 'business' ? (user.orgName ? escapeHtml(user.orgName) : 'Юрлицо') : 'Физлицо'} · ${escapeHtml(user.phone||'')}</p>
 
         <div class="profile-layout">
           <div class="profile-side">
-            ${tabs.map(t => `<a href="#/profile/${t.key}" class="profile-tab ${tab===t.key?'on':''}">${t.label}${t.count!==undefined?`<span class="count">${t.count}</span>`:''}</a>`).join('')}
+            ${tabs.map(t => `<a href="#/profile/${t.key}" class="profile-tab ${tab===t.key?'on':''}">${t.label}</a>`).join('')}
             <button class="profile-tab" onclick="logout()" style="text-align:left;margin-top:24px;color:var(--ink-subtle)">Выйти</button>
           </div>
-          <div>${content}</div>
+          <div id="prof-content">${content}</div>
         </div>
       </div>
+    </div>
+  `;
+
+  // Подгрузка списков с сервера
+  if(tab === 'orders') loadOrdersList();
+  else if(tab === 'customs') loadCustomsList();
+}
+
+async function loadOrdersList(){
+  const target = $('#prof-content');
+  if(!target) return;
+  try {
+    const data = await apiFetch('/api/orders');
+    const orders = data.orders || [];
+    if(orders.length === 0){
+      target.innerHTML = `<p style="padding:40px 0;color:var(--ink-muted);font-size:15px">Заказов пока нет. <a href="#/catalog" style="color:var(--accent);text-decoration:underline">Открыть каталог →</a></p>`;
+      return;
+    }
+    target.innerHTML = orders.map(o => `<div class="order-card">
+      <div class="order-head">
+        <span class="order-id">${escapeHtml(o.id)}</span>
+        <span class="order-status s-${o.status}">${statusLabel(o.status)}</span>
+      </div>
+      <div class="order-items">
+        ${(o.items||[]).slice(0,3).map(i => `${escapeHtml(i.name).slice(0,50)} — ${i.qty}&nbsp;шт`).join('<br>')}
+        ${o.items && o.items.length > 3 ? `<br><span style="color:var(--ink-subtle)">и&nbsp;ещё ${o.items.length-3} ${plural(o.items.length-3,'позиция','позиции','позиций')}</span>` : ''}
+      </div>
+      <div class="order-foot">
+        <span style="color:var(--ink-muted)">${new Date(o.createdAt).toLocaleDateString('ru-RU')} · ${escapeHtml(o.city||'')}</span>
+        <span class="order-total">${fmt(o.total)}&nbsp;₽</span>
+      </div>
+    </div>`).join('');
+  } catch(e) {
+    if(e.status === 401){
+      user = null; saveUser(); renderProfile('orders'); return;
+    }
+    target.innerHTML = `<p style="padding:40px 0;color:var(--accent);font-size:14px">Не удалось загрузить заказы: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function loadCustomsList(){
+  const target = $('#prof-content');
+  if(!target) return;
+  try {
+    const data = await apiFetch('/api/inquiries');
+    const items = data.inquiries || [];
+    if(items.length === 0){
+      target.innerHTML = `<p style="padding:40px 0;color:var(--ink-muted);font-size:15px">Заявок на&nbsp;подбор пока нет. <a href="#/custom" style="color:var(--accent);text-decoration:underline">Оставить заявку →</a></p>`;
+      return;
+    }
+    target.innerHTML = items.map(c => `<div class="order-card">
+      <div class="order-head">
+        <span class="order-id">${escapeHtml(c.id)}</span>
+        <span class="order-status s-${c.status}">${statusLabel(c.status)}</span>
+      </div>
+      <div class="order-items">${escapeHtml(c.description||'').slice(0,200)}${(c.description||'').length>200?'…':''}</div>
+      <div class="order-foot">
+        <span style="color:var(--ink-muted)">${new Date(c.createdAt).toLocaleDateString('ru-RU')} · ${c.quantity}&nbsp;шт</span>
+        <span style="color:var(--ink-muted)">${c.photosCount || 0}&nbsp;фото-референса</span>
+      </div>
+    </div>`).join('');
+  } catch(e) {
+    if(e.status === 401){
+      user = null; saveUser(); renderProfile('customs'); return;
+    }
+    target.innerHTML = `<p style="padding:40px 0;color:var(--accent);font-size:14px">Не удалось загрузить заявки: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function profileInfoFormHtml(){
+  return `
+    <div style="max-width:520px">
+      <h3 style="font-family:var(--font-display);font-variation-settings:'opsz' 80;font-size:22px;margin:0 0 24px;font-weight:500">Контактные данные</h3>
+      <div class="field">
+        <label>Имя</label>
+        <input id="info-name" type="text" value="${escapeHtml(user.name||'')}">
+      </div>
+      <div class="field">
+        <label>Телефон</label>
+        <input id="info-phone" type="tel" value="${escapeHtml(user.phone||'')}">
+      </div>
+      <div class="field">
+        <label>E-mail</label>
+        <input id="info-email" type="email" value="${escapeHtml(user.email||'')}">
+      </div>
+      <p style="font-size:12px;color:var(--ink-subtle);line-height:1.5;margin:0 0 16px">Изменения сейчас сохраняются только локально. В&nbsp;ближайшем обновлении подключим сохранение в&nbsp;аккаунт.</p>
+      <button class="btn" onclick="saveInfo()">Сохранить</button>
+    </div>
+  `;
+}
+
+function profileOrgFormHtml(){
+  return `
+    <div style="max-width:520px">
+      <h3 style="font-family:var(--font-display);font-variation-settings:'opsz' 80;font-size:22px;margin:0 0 24px;font-weight:500">Реквизиты организации</h3>
+      <div class="field">
+        <label>Название</label>
+        <input id="org-name" type="text" value="${escapeHtml(user.orgName||'')}">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>ИНН</label>
+          <input id="org-inn" type="text" value="${escapeHtml(user.inn||'')}">
+        </div>
+        <div class="field">
+          <label>КПП</label>
+          <input id="org-kpp" type="text" value="${escapeHtml(user.kpp||'')}">
+        </div>
+      </div>
+      <div class="field">
+        <label>ОГРН / ОГРНИП</label>
+        <input id="org-ogrn" type="text" value="${escapeHtml(user.ogrn||'')}">
+      </div>
+      <p style="font-size:12px;color:var(--ink-subtle);line-height:1.5;margin:0 0 16px">Изменения сейчас сохраняются только локально. В&nbsp;ближайшем обновлении подключим сохранение в&nbsp;аккаунт.</p>
+      <button class="btn" onclick="saveOrg()">Сохранить</button>
     </div>
   `;
 }
@@ -3000,7 +3221,8 @@ function saveOrg(){
   toast('Сохранено');
 }
 
-function logout(){
+async function logout(){
+  try { await apiFetch('/api/auth/login', { method: 'DELETE' }) } catch(e) {}
   user = null;
   saveUser();
   location.hash = '#/';
@@ -3097,7 +3319,7 @@ function removePhoto(idx){
   slot.innerHTML = `<span class="upload-slot-cap">+ Фото&nbsp;${idx+1}</span><input type="file" accept="image/*" style="display:none" onchange="onPhoto(event, ${idx})">`;
 }
 
-function submitCustom(){
+async function submitCustom(){
   const err = $('#cust-error');
   err.style.display = 'none';
   const desc = $('#cust-desc').value.trim();
@@ -3107,17 +3329,30 @@ function submitCustom(){
   if(desc.length < 10){ err.textContent = 'Опишите задачу хотя бы в нескольких словах'; err.style.display='block'; return }
   if(qty < 1){ err.textContent = 'Укажите количество'; err.style.display='block'; return }
 
-  const proceed = () => {
-    const id = 'CR-' + new Date().toISOString().slice(2,10).replace(/-/g,'') + '-' + String(Math.floor(Math.random()*900)+100);
-    const customs = State.get('customs', []);
-    customs.unshift({
-      id, date: new Date().toISOString(),
-      desc, qty, budget,
-      photos: _customPhotos.filter(Boolean).length,
-      status: 'new'
-    });
-    State.set('customs', customs);
-    showSuccessModal(`Заявка ${id} принята`, `Наш байер в&nbsp;Гуанчжоу пройдёт по&nbsp;фабрикам и&nbsp;вернётся с&nbsp;вариантами в&nbsp;течение 24&nbsp;часов.`, '#/profile/customs');
+  const photos = _customPhotos.filter(Boolean);
+
+  const proceed = async () => {
+    toast('Отправляем заявку...');
+    try {
+      const data = await apiFetch('/api/inquiries', {
+        method: 'POST',
+        body: {
+          description: desc,
+          quantity: qty,
+          budgetRub: budget,
+          photos: photos,
+        },
+      });
+      const id = data.inquiry && data.inquiry.id;
+      showSuccessModal(`Заявка ${id || ''} принята`, `Наш байер в&nbsp;Гуанчжоу пройдёт по&nbsp;фабрикам и&nbsp;вернётся с&nbsp;вариантами в&nbsp;течение 24&nbsp;часов.`, '#/profile/customs');
+    } catch(e) {
+      if(e.status === 401){
+        openRegisterModal(proceed);
+        return;
+      }
+      err.textContent = 'Не удалось отправить заявку: ' + e.message;
+      err.style.display = 'block';
+    }
   };
 
   if(!user){ openRegisterModal(proceed) } else { proceed() }
