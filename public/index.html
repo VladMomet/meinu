@@ -2220,18 +2220,21 @@ function refreshCurrentView(){
 
 function renderHome(){
   const featured = [...PRODUCTS].sort((a,b) => b.price - a.price).slice(0, 8);
-  // Коллаж — берём по одному товару из разных категорий, чтобы фото не дублировались
-  const usedCategories = new Set();
+  // Коллаж в hero — beauty-тематические категории по приоритету.
+  // Из каждой берём самый дорогой товар с фото — это обычно «флагман» категории.
+  const collagePreferred = ['wigs', 'hair', 'nails', 'makeup', 'skincare'];
   const collage = [];
-  for(const p of [...PRODUCTS].sort((a,b) => b.price - a.price)){
-    if(!p.img || usedCategories.has(p.category)) continue;
-    collage.push(p);
-    usedCategories.add(p.category);
-    if(collage.length === 3) break;
+  for(const cat of collagePreferred){
+    if(collage.length >= 3) break;
+    const item = [...PRODUCTS]
+      .filter(p => p.category === cat && p.img)
+      .sort((a, b) => b.price - a.price)[0];
+    if(item) collage.push(item);
   }
-  // Запасной вариант если категорий мало
+  // Запасной вариант — добираем любые с фото
   if(collage.length < 3){
-    for(const p of [...PRODUCTS].sort((a,b) => b.price - a.price)){
+    for(const p of PRODUCTS){
+      if(!p.img) continue;
       if(collage.find(c => c.id === p.id)) continue;
       collage.push(p);
       if(collage.length === 3) break;
