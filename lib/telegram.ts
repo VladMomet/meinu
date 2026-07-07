@@ -1,5 +1,8 @@
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
+// Опциональная метка сайта. Если задана — префикс идёт в начало каждого сообщения.
+// Примеры значений: "MeiNu Эконом", "MeiNu Премиум". На основном сайте переменную не задаём.
+const SITE_LABEL = (process.env.SITE_LABEL || '').trim();
 
 /**
  * Отправить сообщение в Telegram-чат менеджеров.
@@ -36,6 +39,11 @@ export async function notifyTelegram(text: string, opts?: { inlineKeyboard?: Arr
 
 const escape = (s: string) => s.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]!));
 
+// Формирует префикс с меткой сайта. Если SITE_LABEL не задан — пустая строка.
+function sitePrefix(): string {
+  return SITE_LABEL ? `🏷 <i>${escape(SITE_LABEL)}</i>\n\n` : '';
+}
+
 export function formatOrderMessage(o: {
   id: string;
   city: string;
@@ -52,7 +60,7 @@ export function formatOrderMessage(o: {
     : `<b>Физлицо:</b> ${escape(o.user.name)}, ${escape(o.user.phone)}`;
   const email = o.user.email ? `\n<b>E-mail:</b> ${escape(o.user.email)}` : '';
 
-  return `🛒 <b>Новый заказ ${o.id}</b>\n\n${userBlock}${email}\n<b>Город:</b> ${escape(o.city)}\n\n${itemsText}\n\n<b>Итого:</b> ${o.total.toLocaleString('ru-RU')} ₽`;
+  return `${sitePrefix()}🛒 <b>Новый заказ ${o.id}</b>\n\n${userBlock}${email}\n<b>Город:</b> ${escape(o.city)}\n\n${itemsText}\n\n<b>Итого:</b> ${o.total.toLocaleString('ru-RU')} ₽`;
 }
 
 export function formatInquiryMessage(q: {
@@ -69,7 +77,7 @@ export function formatInquiryMessage(q: {
   const email = q.user.email ? `\n<b>E-mail:</b> ${escape(q.user.email)}` : '';
   const budget = q.budgetRub ? `\n<b>Бюджет:</b> до ${q.budgetRub.toLocaleString('ru-RU')} ₽ за шт` : '';
 
-  return `🔍 <b>Заявка на подбор ${q.id}</b>\n\n${userBlock}${email}\n<b>Количество:</b> ${q.quantity} шт${budget}\n<b>Фото-референсов:</b> ${q.photosCount}\n\n<b>Описание:</b>\n${escape(q.description)}`;
+  return `${sitePrefix()}🔍 <b>Заявка на подбор ${q.id}</b>\n\n${userBlock}${email}\n<b>Количество:</b> ${q.quantity} шт${budget}\n<b>Фото-референсов:</b> ${q.photosCount}\n\n<b>Описание:</b>\n${escape(q.description)}`;
 }
 
 export function statusKeyboard(orderId: string, kind: 'order' | 'inquiry') {
